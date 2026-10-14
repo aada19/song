@@ -1,26 +1,22 @@
 
-import io
-import time
-import wave
 import threading
-import base64
-import streamlit.components.v1 as components
-import av
+import numpy as np
 import cv2
 import mediapipe as mp
-import numpy as np
+import av
 import streamlit as st
 
 from streamlit_webrtc import (
     webrtc_streamer,
     WebRtcMode,
     VideoProcessorBase,
+    AudioProcessorBase,
 )
 
-# ==========================================================
+# =========================================================
 # GESTURE GUITAR AI
-# Webcam hand gestures + guitar-like chord audio
-# ==========================================================
+# Hand gestures control continuously playing guitar chords
+# =========================================================
 
 st.set_page_config(
     page_title="Gesture Guitar AI",
@@ -33,14 +29,14 @@ st.markdown(
     <style>
     .main-title {
         text-align: center;
+        color: #8055ff;
         font-size: 42px;
         font-weight: 800;
-        color: #7C5CFF;
     }
     .subtitle {
         text-align: center;
+        color: #888;
         font-size: 17px;
-        color: #888888;
     }
     </style>
     """,
@@ -52,17 +48,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    '<div class="subtitle">'
-    'Play guitar-like chords using your hand gestures'
-    '</div>',
+    '<div class="subtitle">Show a hand gesture and play guitar chords!</div>',
     unsafe_allow_html=True,
 )
 
-SAMPLE_RATE = 44100
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
 
-# Map the number of extended fingers to a chord.
+SAMPLE_RATE = 48000
+STRUM_LENGTH = 2.0
+
 GESTURE_CHORDS = {
-    0: "Em",  # Closed fist
+    0: "Em",  # Fist
     1: "C",   # One finger
     2: "D",   # Two fingers
     3: "G",   # Three fingers
@@ -80,52 +78,51 @@ CHORD_NOTES = {
 }
 
 
-def make_guitar_audio(chord, duration=1.8):
-    """Synthesize a plucked-string-like chord as WAV audio."""
-    notes = CHORD_NOTES[chord]
-    t = np.arange(int(SAMPLE_RATE * duration)) / SAMPLE_RATE
-    audio = np.zeros_like(t, dtype=np.float64)
+# ---------------------------------------------------------
+# SHARED STATE: connects webcam detection to audio playback
+# ---------------------------------------------------------
 
-    for index, frequency in enumerate(notes):
-        string = np.zeros_like(t)
+class GuitarState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.chord = None
+        self.fingers = None
+        self.candidate = None
+        self.candidate_frames = 0
 
-        # Fundamental plus harmonics for a string-like timbre.
-        for harmonic in range(1, 5):
-            string += (
-                np.sin(2 * np.pi * frequency * harmonic * t)
-                / harmonic
-            )
+    def update(self, chord, fingers):
+        with self.lock:
+            self.fingers = fingers
 
-        # Small variations between strings.
-        delay = index * 0.018
-        shifted_t = np.maximum(t - delay, 0)
-        envelope = np.exp(-2.4 * shifted_t)
-        envelope[t < delay] = 0
+            if chord is None:
+                self.candidate = None
+                self.candidate_frames = 0
+                self.chord = None
+                return
 
-        audio += string * envelope / len(notes)
+            if chord == self.candidate:
+                self.candidate_frames += 1
+            else:
+                self.candidate = chord
+                self.candidate_frames = 1
 
-    peak = np.max(np.abs(audio))
-    if peak > 0:
-        audio = audio / peak * 0.85
-
-    samples = (audio * 32767).astype(np.int16)
-
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(SAMPLE_RATE)
-        wav.writeframes(samples.tobytes())
-
-    return buffer.getvalue()
+            # Avoid switching chords because of one bad camera frame.
+            if self.candidate_frames >= 3:
+                self.chord = chord
 
 
-def count_fingers(hand_landmarks, handedness):
-    """Estimate how many fingers are extended."""
-    lm = hand_landmarks.landmark
+guitar_state = GuitarState()
+
+
+# ---------------------------------------------------------
+# HAND GESTURE DETECTION
+# ---------------------------------------------------------
+
+def count_fingers(hand, handedness):
+    lm = hand.landmark
     count = 0
 
-    # Thumb: compare horizontal positions, accounting for hand side.
+    # Thumb
     if handedness == "Right":
         if lm[4].x < lm[3].x:
             count += 1
@@ -133,22 +130,16 @@ def count_fingers(hand_landmarks, handedness):
         if lm[4].x > lm[3].x:
             count += 1
 
-    # Index, middle, ring and little fingers.
-    finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-
-    for tip, pip in finger_pairs:
-        if lm[tip].y < lm[pip].y:
+    # Index, middle, ring and little fingers
+    for tip, joint in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        if lm[tip].y < lm[joint].y:
             count += 1
 
     return count
 
 
-class GuitarProcessor(VideoProcessorBase):
+class GuitarVideoProcessor(VideoProcessorBase):
     def __init__(self):
-        self.lock = threading.Lock()
-        self.detected_chord = None
-        self.finger_count = None
-
         self.hands = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
@@ -159,18 +150,18 @@ class GuitarProcessor(VideoProcessorBase):
     def recv(self, frame):
         image = frame.to_ndarray(format="bgr24")
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+        result = self.hands.process(rgb)
 
         chord = None
         fingers = None
 
-        if results.multi_hand_landmarks:
-            hand = results.multi_hand_landmarks[0]
+        if result.multi_hand_landmarks:
+            hand = result.multi_hand_landmarks[0]
 
             handedness = "Right"
-            if results.multi_handedness:
+            if result.multi_handedness:
                 handedness = (
-                    results.multi_handedness[0]
+                    result.multi_handedness[0]
                     .classification[0].label
                 )
 
@@ -185,34 +176,153 @@ class GuitarProcessor(VideoProcessorBase):
 
             cv2.putText(
                 image,
-                f"{chord} chord | {fingers} fingers",
-                (20, 45),
+                f"CHORD: {chord} | FINGERS: {fingers}",
+                (15, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                0.8,
                 (80, 255, 130),
                 2,
             )
         else:
             cv2.putText(
                 image,
-                "Show one hand to the camera",
-                (20, 45),
+                "Show one hand to play",
+                (15, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.8,
                 (255, 255, 255),
                 2,
             )
 
+        guitar_state.update(chord, fingers)
+
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+
+# ---------------------------------------------------------
+# CONTINUOUS GUITAR AUDIO
+# The browser microphone provides an audio stream, but its
+# captured sound is replaced by synthesized guitar audio.
+# ---------------------------------------------------------
+
+class GuitarAudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.last_chord = None
+        self.sample_position = 0
+        self.lock = threading.Lock()
+
+    def make_strum(self, chord, sample_count, sample_rate):
+        """Create a repeating plucked-string-like chord."""
+        if chord not in CHORD_NOTES:
+            return np.zeros(sample_count, dtype=np.float32)
+
+        # Repeat the strum while the same gesture is held.
+        positions = (
+            self.sample_position + np.arange(sample_count)
+        ) / sample_rate
+        local_time = positions % STRUM_LENGTH
+
+        audio = np.zeros(sample_count, dtype=np.float64)
+        notes = CHORD_NOTES[chord]
+
+        for index, frequency in enumerate(notes):
+            delay = index * 0.025
+            note_time = local_time - delay
+            active = note_time >= 0
+            safe_time = np.maximum(note_time, 0)
+
+            # Fundamental plus softer harmonics.
+            string = (
+                np.sin(2 * np.pi * frequency * safe_time)
+                + 0.40 * np.sin(
+                    2 * np.pi * frequency * 2 * safe_time
+                )
+                + 0.16 * np.sin(
+                    2 * np.pi * frequency * 3 * safe_time
+                )
+            )
+
+            envelope = np.exp(-2.2 * safe_time)
+            envelope *= active
+            audio += string * envelope / len(notes)
+
+        # Fade the loop boundary to reduce audible clicks.
+        fade_length = min(int(sample_rate * 0.015), sample_count)
+        if fade_length > 0:
+            fade = np.linspace(0, 1, fade_length)
+            boundary = (local_time < 0.015) | (
+                local_time > STRUM_LENGTH - 0.015
+            )
+            audio[local_time < 0.015] *= fade[
+                :np.count_nonzero(local_time < 0.015)
+            ] if np.count_nonzero(local_time < 0.015) <= fade_length else 1
+
+        peak = np.max(np.abs(audio)) if audio.size else 0
+        if peak > 0:
+            audio = audio / max(peak, 1.0) * 0.65
+
+        return audio.astype(np.float32)
+
+    def recv(self, frame):
+        sample_rate = frame.sample_rate or SAMPLE_RATE
+        sample_count = frame.samples
+        fmt = frame.format.name
+        layout = frame.layout.name
+        channels = len(frame.layout.channels)
+
+        with guitar_state.lock:
+            chord = guitar_state.chord
+
         with self.lock:
-            self.detected_chord = chord
-            self.finger_count = fingers
+            if chord != self.last_chord:
+                self.last_chord = chord
+                self.sample_position = 0
 
-        return av.VideoFrame.from_ndarray(
-            image, format="bgr24"
+            if chord is None:
+                mono = np.zeros(sample_count, dtype=np.float32)
+            else:
+                mono = self.make_strum(
+                    chord, sample_count, sample_rate
+                )
+
+            self.sample_position += sample_count
+
+        # Match the browser's incoming audio format and layout.
+        if fmt.startswith("s16"):
+            converted = np.clip(mono * 32767, -32768, 32767).astype(
+                np.int16
+            )
+        elif fmt.startswith("s32"):
+            converted = np.clip(
+                mono * 2147483647, -2147483648, 2147483647
+            ).astype(np.int32)
+        elif fmt.startswith("u8"):
+            converted = np.clip(
+                mono * 127 + 128, 0, 255
+            ).astype(np.uint8)
+        else:
+            converted = mono.astype(np.float32)
+
+        if frame.format.is_planar:
+            output = np.tile(converted, (channels, 1))
+        else:
+            output = np.repeat(converted, channels).reshape(1, -1)
+
+        new_frame = av.AudioFrame.from_ndarray(
+            output, format=fmt, layout=layout
         )
+        new_frame.sample_rate = sample_rate
+        new_frame.pts = frame.pts
+        new_frame.time_base = frame.time_base
+
+        return new_frame
 
 
-st.markdown("### 🎵 Gesture guide")
+# ---------------------------------------------------------
+# USER INTERFACE
+# ---------------------------------------------------------
+
+st.markdown("### 🎵 How to play")
 
 st.markdown(
     """
@@ -220,7 +330,7 @@ st.markdown(
     |---|---|
     | ✊ Closed fist | Em |
     | ☝️ One finger | C |
-    | Two fingers | D |
+    | ✌️ Two fingers | D |
     | Three fingers | G |
     | Four fingers | A |
     | ✋ Open hand | E |
@@ -228,108 +338,40 @@ st.markdown(
 )
 
 st.info(
-    "Start the webcam, allow camera access, and show one hand. "
-    "The number of extended fingers selects the chord."
+    "Click START GUITAR and allow both camera and microphone "
+    "permissions. Hold your hand in view to play. Change your "
+    "gesture to switch chords; hide your hand to silence the guitar."
 )
 
-# The browser may require a user interaction before audio can play.
-if "sound_enabled" not in st.session_state:
-    st.session_state.sound_enabled = False
-
-if "last_played_chord" not in st.session_state:
-    st.session_state.last_played_chord = None
-
-if st.button("🔊 Enable sound", type="primary"):
-    st.session_state.sound_enabled = True
-    st.success("Sound enabled. Use the Play chord button to test audio.")
-
 ctx = webrtc_streamer(
-    key="gesture-guitar",
+    key="gesture-guitar-live",
     mode=WebRtcMode.SENDRECV,
-    video_processor_factory=GuitarProcessor,
+    video_processor_factory=GuitarVideoProcessor,
+    audio_processor_factory=GuitarAudioProcessor,
     media_stream_constraints={
         "video": True,
-        "audio": False,
+        "audio": True,
     },
     async_processing=True,
 )
 
-st.markdown("### 🎸 Detected chord")
+st.markdown("### 🎸 Live chord")
 
-@st.fragment(run_every="500ms")
-def show_chord():
-    if not ctx.state.playing or ctx.video_processor is None:
-        st.write("Start the webcam to detect a chord.")
-        return
+with st.container():
+    with guitar_state.lock:
+        current_chord = guitar_state.chord
+        current_fingers = guitar_state.fingers
 
-    processor = ctx.video_processor
-
-    with processor.lock:
-        chord = processor.detected_chord
-        fingers = processor.finger_count
-
-    if chord is None:
-        st.write("No hand detected. Hold your hand clearly in view.")
-        return
-
-    st.subheader(f"Current chord: {chord}")
-    st.write(f"Extended fingers detected: {fingers}")
-
-    if st.session_state.sound_enabled:
-        if chord != st.session_state.last_played_chord:
-            audio_data = make_guitar_audio(chord)
-            st.audio(audio_data, format="audio/wav", autoplay=True)
-            st.session_state.last_played_chord = chord
+    if ctx.state.playing:
+        if current_chord:
+            st.subheader(f"🎶 Playing: {current_chord}")
+            st.write(f"Detected extended fingers: {current_fingers}")
+        else:
+            st.write("Waiting for a hand gesture...")
     else:
-        st.caption("Click Enable sound to activate audio playback.")
+        st.write("Start the camera and microphone to begin.")
 
-show_chord()
-
-st.markdown("---")
-st.markdown("### 🎹 Test guitar sound")
-
-manual_chord = st.selectbox(
-    "Choose a chord to test",
-    list(CHORD_NOTES.keys()),
-    key="manual_audio_chord",
+st.caption(
+    "Tip: Use a quiet room, keep your hand fully visible, "
+    "and allow browser camera and microphone access."
 )
-
-if st.button("▶️ Play chord", key="manual_play_button"):
-    audio_data = make_guitar_audio(manual_chord)
-    encoded_audio = base64.b64encode(audio_data).decode("utf-8")
-
-    components.html(
-        f"""
-        <div style="font-family: sans-serif; text-align: center;">
-            <p>Selected chord: <b>{manual_chord}</b></p>
-            <audio id="guitar-audio" controls>
-                <source
-                    src="data:audio/wav;base64,{encoded_audio}"
-                    type="audio/wav"
-                >
-                Your browser does not support audio.
-            </audio>
-            <br><br>
-            <button
-                onclick="
-                    const audio = document.getElementById('guitar-audio');
-                    audio.currentTime = 0;
-                    audio.play().catch(error =>
-                        alert('Playback failed: ' + error.message)
-                    );
-                "
-                style="
-                    padding: 10px 22px;
-                    background: #7655ff;
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    cursor: pointer;
-                "
-            >
-                🔊 Play guitar sound
-            </button>
-        </div>
-        """,
-        height=150,
-    )

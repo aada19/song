@@ -3,7 +3,8 @@ import io
 import time
 import wave
 import threading
-
+import base64
+import streamlit.components.v1 as components
 import av
 import cv2
 import mediapipe as mp
@@ -285,21 +286,50 @@ def show_chord():
 show_chord()
 
 st.markdown("---")
-st.markdown("### 🎹 Test audio manually")
+st.markdown("### 🎹 Test guitar sound")
 
 manual_chord = st.selectbox(
     "Choose a chord to test",
     list(CHORD_NOTES.keys()),
+    key="manual_audio_chord",
 )
 
-if st.button("▶️ Play chord"):
-    st.audio(
-        make_guitar_audio(manual_chord),
-        format="audio/wav",
+if st.button("▶️ Play chord", key="manual_play_button"):
+    audio_data = make_guitar_audio(manual_chord)
+    encoded_audio = base64.b64encode(audio_data).decode("utf-8")
+
+    components.html(
+        f"""
+        <div style="font-family: sans-serif; text-align: center;">
+            <p>Selected chord: <b>{manual_chord}</b></p>
+            <audio id="guitar-audio" controls>
+                <source
+                    src="data:audio/wav;base64,{encoded_audio}"
+                    type="audio/wav"
+                >
+                Your browser does not support audio.
+            </audio>
+            <br><br>
+            <button
+                onclick="
+                    const audio = document.getElementById('guitar-audio');
+                    audio.currentTime = 0;
+                    audio.play().catch(error =>
+                        alert('Playback failed: ' + error.message)
+                    );
+                "
+                style="
+                    padding: 10px 22px;
+                    background: #7655ff;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    cursor: pointer;
+                "
+            >
+                🔊 Play guitar sound
+            </button>
+        </div>
+        """,
+        height=150,
     )
-
-st.caption(
-    "Audio is synthesized in Python and resembles a plucked string; "
-    "it is not a recording of a real guitar. Gesture recognition "
-    "selects chords by finger count, so it is a simple demonstration."
-)

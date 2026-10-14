@@ -3,13 +3,16 @@ import cv2
 import mediapipe as mp
 import av
 import time
+import os
+import wave
+import numpy as np
+
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
 
 # ============================================================
 # 🎸 GESTURE GUITAR AI
-# Hand gestures control different guitar chords
-# Webcam + MediaPipe + Streamlit WebRTC
+# Webcam + MediaPipe + Streamlit WebRTC + Guitar Audio
 # ============================================================
 
 st.set_page_config(
@@ -20,47 +23,47 @@ st.set_page_config(
 
 
 # ============================================================
-# CUSTOM CSS
+# CSS
 # ============================================================
 
-st.markdown(
-    """
-    <style>
+st.markdown("""
+<style>
 
-    .main-title {
-        font-size: 48px;
-        font-weight: 800;
-        text-align: center;
-        margin-bottom: 5px;
-    }
+.main-title {
+    font-size: 48px;
+    font-weight: 800;
+    text-align: center;
+    margin-bottom: 5px;
+}
 
-    .subtitle {
-        text-align: center;
-        font-size: 18px;
-        margin-bottom: 25px;
-    }
+.subtitle {
+    text-align: center;
+    font-size: 18px;
+    margin-bottom: 25px;
+}
 
-    .chord-box {
-        padding: 25px;
-        border-radius: 18px;
-        text-align: center;
-        margin-top: 20px;
-        border: 2px solid #555;
-    }
+.chord-box {
+    padding: 25px;
+    border-radius: 18px;
+    text-align: center;
+    border: 2px solid #555;
+    margin-top: 10px;
+}
 
-    .chord-name {
-        font-size: 55px;
-        font-weight: bold;
-    }
+.chord-name {
+    font-size: 60px;
+    font-weight: bold;
+}
 
-    .gesture-table {
-        font-size: 18px;
-    }
+.info-box {
+    padding: 15px;
+    border-radius: 12px;
+    border: 1px solid #555;
+    margin-top: 10px;
+}
 
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+</style>
+""", unsafe_allow_html=True)
 
 
 # ============================================================
@@ -73,38 +76,193 @@ st.markdown(
 )
 
 st.markdown(
-    '<div class="subtitle">Control guitar chords using your hand gestures</div>',
+    '<div class="subtitle">'
+    'Play guitar chords using your hand gestures'
+    '</div>',
     unsafe_allow_html=True
 )
 
 
 # ============================================================
-# SESSION STATE
+# CREATE GUITAR-LIKE CHORD AUDIO
 # ============================================================
 
-if "chord" not in st.session_state:
-    st.session_state.chord = "Waiting..."
+AUDIO_FOLDER = "guitar_chords"
 
-if "gesture" not in st.session_state:
-    st.session_state.gesture = "No hand detected"
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+
+
+# Guitar chord frequencies
+CHORDS = {
+
+    "C": [
+        130.81,   # C3
+        164.81,   # E3
+        196.00,   # G3
+        261.63,   # C4
+        329.63    # E4
+    ],
+
+    "D": [
+        146.83,   # D3
+        220.00,   # A3
+        293.66,   # D4
+        369.99,   # F#4
+        440.00    # A4
+    ],
+
+    "E": [
+        82.41,    # E2
+        123.47,   # B2
+        164.81,   # E3
+        207.65,   # G#3
+        246.94,   # B3
+        329.63    # E4
+    ],
+
+    "G": [
+        98.00,    # G2
+        146.83,   # D3
+        196.00,   # G3
+        246.94,   # B3
+        293.66,   # D4
+        392.00    # G4
+    ],
+
+    "A": [
+        110.00,   # A2
+        164.81,   # E3
+        220.00,   # A3
+        277.18,   # C#4
+        329.63,   # E4
+        440.00    # A4
+    ],
+
+    "Em": [
+        82.41,    # E2
+        123.47,   # B2
+        164.81,   # E3
+        196.00,   # G3
+        246.94,   # B3
+        329.63    # E4
+    ]
+}
+
+
+def create_guitar_chord(frequencies, filename):
+
+    """
+    Creates a short guitar-like plucked chord.
+    """
+
+    sample_rate = 44100
+    duration = 1.6
+
+    total_samples = int(sample_rate * duration)
+
+    audio = np.zeros(total_samples)
+
+    # Slight delay between strings to imitate strumming
+    delays = np.linspace(
+        0,
+        0.12,
+        len(frequencies)
+    )
+
+    for frequency, delay in zip(frequencies, delays):
+
+        start = int(delay * sample_rate)
+
+        t = np.arange(
+            total_samples - start
+        ) / sample_rate
+
+        # Fundamental + harmonics
+        signal = (
+            1.00 * np.sin(2 * np.pi * frequency * t)
+            + 0.35 * np.sin(2 * np.pi * frequency * 2 * t)
+            + 0.18 * np.sin(2 * np.pi * frequency * 3 * t)
+            + 0.08 * np.sin(2 * np.pi * frequency * 4 * t)
+        )
+
+        # Guitar-like attack and decay
+        attack_time = 0.015
+        attack_samples = int(
+            attack_time * sample_rate
+        )
+
+        envelope = np.exp(
+            -2.8 * np.arange(len(t)) / sample_rate
+        )
+
+        attack = np.ones(len(t))
+
+        if attack_samples > 0:
+            attack[:attack_samples] = np.linspace(
+                0,
+                1,
+                attack_samples
+            )
+
+        signal *= envelope
+        signal *= attack
+
+        audio[start:] += signal
+
+    # Normalize
+    maximum = np.max(np.abs(audio))
+
+    if maximum > 0:
+        audio = audio / maximum
+
+    # Slight volume reduction
+    audio *= 0.65
+
+    # Convert to 16-bit PCM
+    audio_int16 = np.int16(
+        audio * 32767
+    )
+
+    # Save WAV
+    with wave.open(filename, "wb") as wav:
+
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+
+        wav.writeframes(
+            audio_int16.tobytes()
+        )
 
 
 # ============================================================
-# MEDIAPIPE SETUP
+# GENERATE CHORD FILES
 # ============================================================
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+for chord_name, frequencies in CHORDS.items():
+
+    chord_file = os.path.join(
+        AUDIO_FOLDER,
+        chord_name + ".wav"
+    )
+
+    if not os.path.exists(chord_file):
+
+        create_guitar_chord(
+            frequencies,
+            chord_file
+        )
 
 
 # ============================================================
 # FINGER DETECTION
 # ============================================================
 
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+
 def count_fingers(hand_landmarks, handedness):
-    """
-    Detects how many fingers are raised.
-    """
 
     landmarks = hand_landmarks.landmark
 
@@ -118,11 +276,14 @@ def count_fingers(hand_landmarks, handedness):
     thumb_ip = landmarks[3]
 
     if handedness == "Right":
+
         if thumb_tip.x < thumb_ip.x:
             fingers.append(1)
         else:
             fingers.append(0)
+
     else:
+
         if thumb_tip.x > thumb_ip.x:
             fingers.append(1)
         else:
@@ -132,37 +293,33 @@ def count_fingers(hand_landmarks, handedness):
     # INDEX
     # --------------------------------------------------------
 
-    if landmarks[8].y < landmarks[6].y:
-        fingers.append(1)
-    else:
-        fingers.append(0)
+    fingers.append(
+        1 if landmarks[8].y < landmarks[6].y else 0
+    )
 
     # --------------------------------------------------------
     # MIDDLE
     # --------------------------------------------------------
 
-    if landmarks[12].y < landmarks[10].y:
-        fingers.append(1)
-    else:
-        fingers.append(0)
+    fingers.append(
+        1 if landmarks[12].y < landmarks[10].y else 0
+    )
 
     # --------------------------------------------------------
     # RING
     # --------------------------------------------------------
 
-    if landmarks[16].y < landmarks[14].y:
-        fingers.append(1)
-    else:
-        fingers.append(0)
+    fingers.append(
+        1 if landmarks[16].y < landmarks[14].y else 0
+    )
 
     # --------------------------------------------------------
     # LITTLE
     # --------------------------------------------------------
 
-    if landmarks[20].y < landmarks[18].y:
-        fingers.append(1)
-    else:
-        fingers.append(0)
+    fingers.append(
+        1 if landmarks[20].y < landmarks[18].y else 0
+    )
 
     return sum(fingers)
 
@@ -212,24 +369,26 @@ class GestureProcessor(VideoProcessorBase):
         self.chord = "Waiting..."
         self.gesture = "No hand detected"
 
-        self.last_change = time.time()
+        self.last_chord = "Waiting..."
 
     def recv(self, frame):
 
-        # Convert WebRTC frame to OpenCV
-        image = frame.to_ndarray(format="bgr24")
+        image = frame.to_ndarray(
+            format="bgr24"
+        )
 
-        # Mirror webcam image
+        # Mirror webcam
         image = cv2.flip(image, 1)
 
-        # Convert BGR → RGB
+        # BGR → RGB
         rgb_image = cv2.cvtColor(
             image,
             cv2.COLOR_BGR2RGB
         )
 
-        # Detect hands
-        results = self.hands.process(rgb_image)
+        results = self.hands.process(
+            rgb_image
+        )
 
         detected_chord = "Waiting..."
         detected_gesture = "No hand detected"
@@ -240,27 +399,33 @@ class GestureProcessor(VideoProcessorBase):
 
         if results.multi_hand_landmarks:
 
-            hand_landmarks = results.multi_hand_landmarks[0]
+            hand_landmarks = (
+                results.multi_hand_landmarks[0]
+            )
 
-            handedness = results.multi_handedness[0].classification[0].label
+            handedness = (
+                results.multi_handedness[0]
+                .classification[0]
+                .label
+            )
 
             finger_count = count_fingers(
                 hand_landmarks,
                 handedness
             )
 
-            detected_chord, detected_gesture = get_chord(
-                finger_count
+            detected_chord, detected_gesture = (
+                get_chord(finger_count)
             )
 
-            # Draw hand landmarks
+            # Draw hand
             mp_drawing.draw_landmarks(
                 image,
                 hand_landmarks,
                 mp_hands.HAND_CONNECTIONS
             )
 
-            # Display gesture on camera
+            # Camera text
             cv2.putText(
                 image,
                 detected_gesture,
@@ -274,7 +439,7 @@ class GestureProcessor(VideoProcessorBase):
             cv2.putText(
                 image,
                 "CHORD: " + detected_chord,
-                (20, 95),
+                (20, 100),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.2,
                 (0, 255, 150),
@@ -282,9 +447,6 @@ class GestureProcessor(VideoProcessorBase):
             )
 
         else:
-
-            detected_chord = "Waiting..."
-            detected_gesture = "No hand detected"
 
             cv2.putText(
                 image,
@@ -296,10 +458,11 @@ class GestureProcessor(VideoProcessorBase):
                 2
             )
 
-        # Store latest result
+        # Store result
         self.chord = detected_chord
         self.gesture = detected_gesture
 
+        # Return frame
         return av.VideoFrame.from_ndarray(
             image,
             format="bgr24"
@@ -307,10 +470,21 @@ class GestureProcessor(VideoProcessorBase):
 
 
 # ============================================================
-# MAIN LAYOUT
+# SESSION STATE
 # ============================================================
 
-left, right = st.columns([2, 1])
+if "last_played_chord" not in st.session_state:
+
+    st.session_state.last_played_chord = ""
+
+
+# ============================================================
+# LAYOUT
+# ============================================================
+
+left, right = st.columns(
+    [2, 1]
+)
 
 
 # ============================================================
@@ -319,9 +493,10 @@ left, right = st.columns([2, 1])
 
 with left:
 
-    st.subheader("📷 Your Webcam")
+    st.subheader("📷 Webcam")
 
     ctx = webrtc_streamer(
+
         key="gesture-guitar",
 
         video_processor_factory=GestureProcessor,
@@ -346,38 +521,65 @@ with left:
 
 
 # ============================================================
-# CHORD DISPLAY
+# CHORD PANEL
 # ============================================================
 
 with right:
 
-    st.subheader("🎵 Current Chord")
-
-    chord_placeholder = st.empty()
-    gesture_placeholder = st.empty()
+    st.subheader("🎵 Detected Chord")
 
     if ctx.video_processor:
 
         chord = ctx.video_processor.chord
         gesture = ctx.video_processor.gesture
 
-        chord_placeholder.markdown(
+        st.markdown(
             f"""
             <div class="chord-box">
                 <div>Current Chord</div>
-                <div class="chord-name">{chord}</div>
+                <div class="chord-name">
+                    {chord}
+                </div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        gesture_placeholder.info(
-            f"Detected Gesture: {gesture}"
+        st.write(
+            f"**Gesture:** {gesture}"
         )
+
+        # ----------------------------------------------------
+        # AUTOMATIC AUDIO
+        # ----------------------------------------------------
+
+        if (
+            chord != "Waiting..."
+            and chord != st.session_state.last_played_chord
+        ):
+
+            audio_file = os.path.join(
+                AUDIO_FOLDER,
+                chord + ".wav"
+            )
+
+            if os.path.exists(audio_file):
+
+                st.audio(
+                    audio_file,
+                    format="audio/wav",
+                    autoplay=True
+                )
+
+                st.session_state.last_played_chord = chord
+
+                st.success(
+                    f"🎸 Playing {chord} chord!"
+                )
 
     else:
 
-        chord_placeholder.markdown(
+        st.markdown(
             """
             <div class="chord-box">
                 <div>Current Chord</div>
@@ -387,8 +589,8 @@ with right:
             unsafe_allow_html=True
         )
 
-        gesture_placeholder.info(
-            "Click START and show your hand."
+        st.info(
+            "Click START and allow webcam access."
         )
 
 
@@ -400,17 +602,21 @@ st.divider()
 
 st.subheader("🎸 Gesture → Guitar Chord")
 
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
+
     st.markdown("### ☝️")
     st.write("**1 Finger → C Chord**")
 
 with col2:
+
     st.markdown("### ✌️")
     st.write("**2 Fingers → D Chord**")
 
 with col3:
+
     st.markdown("### 🤟")
     st.write("**3 Fingers → E Chord**")
 
@@ -418,43 +624,41 @@ with col3:
 col4, col5, col6 = st.columns(3)
 
 with col4:
+
     st.markdown("### 🖐️")
     st.write("**4 Fingers → G Chord**")
 
 with col5:
+
     st.markdown("### ✋")
     st.write("**5 Fingers → A Chord**")
 
 with col6:
+
     st.markdown("### ✊")
     st.write("**Fist → Em Chord**")
 
 
 # ============================================================
-# INSTRUCTIONS
+# HOW IT WORKS
 # ============================================================
 
 st.divider()
 
 st.subheader("🎮 How to Play")
 
-st.write(
-    """
-    1. Click **START** above.
-    
-    2. Allow the browser to access your webcam.
-    
-    3. Show one hand clearly in front of the camera.
-    
-    4. Change your hand gesture.
-    
-    5. The AI detects the number of raised fingers.
-    
-    6. The corresponding guitar chord appears on the screen.
-    """
-)
+st.write("""
+1. Click **START**.
+2. Allow access to your webcam.
+3. Show your hand to the camera.
+4. Make one of the six gestures.
+5. The AI identifies your gesture.
+6. The corresponding guitar chord is detected.
+7. The chord sound automatically plays. 🎸
+""")
+
 
 st.info(
-    "💡 Tip: Keep your hand clearly visible and "
-    "reasonably close to the webcam."
+    "💡 Change your hand gesture to another gesture "
+    "to play another chord."
 )

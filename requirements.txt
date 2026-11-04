@@ -1,6 +1,6 @@
 
 streamlit
-streamlit-webrtc
+streamlit-webrtc==0.79.0
 av==16.0.1
 numpy==1.26.4
 mediapipe==0.10.21
